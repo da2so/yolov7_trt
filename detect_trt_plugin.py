@@ -9,7 +9,6 @@ import argparse
 import yaml
 import os
 import sys
-from abc import ABC, abstractmethod
 from pathlib import Path
 
 # import lib for tensorrt
@@ -24,70 +23,10 @@ except ImportError:
 
 
 
-class ModelWrapper():
-    """Abstract class for model wrapper."""
-    def __init__(self, model_path: str):
-        self._model_path = model_path
-        self._model = None
-        self._inputs = None
-        self._outputs = None
-        self._input_size = None
-
-    @property
-    def model_path(self):
-        return self._model_path
-
-    @model_path.setter
-    def model_path(self, value: str):
-        self._model_path = value
-
-    @property
-    def model(self):
-        return self._model
-
-    @model.setter
-    def model(self, value):
-        self._model = value
-
-    @property
-    def inputs(self):
-        return self._inputs
-
-    @inputs.setter
-    def inputs(self, value):
-        self._inputs = value
-
-    @property
-    def outputs(self):
-        return self._outputs
-
-    @outputs.setter
-    def outputs(self, value):
-        self._outputs = value
-
-    @property
-    def input_size(self):
-        return self._input_size
-
-    @input_size.setter
-    def input_size(self, value):
-        self._input_size = value
-
-    @abstractmethod
-    def load_model(self):
-        """Set up model. please specify self.model """
-        pass
-
-    @abstractmethod
-    def inference(self, input_images):
-        """Run inference."""
-        pass
-
-
-class TRTWrapper(ModelWrapper):
+class TRTWrapper():
     """TensorRT model wrapper."""
     def __init__(self, model_path, batch):
-        super(TRTWrapper, self).__init__(model_path)
+        self.model_path = model_path
         self._batch = batch
         self._bindings = None
 
@@ -109,66 +48,94 @@ class TRTWrapper(ModelWrapper):
 
     def load_model(self):
         TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
-        runtime = trt.Runtime(TRT_LOGGER)
-        trt.init_libnvinfer_plugins(None, "")
+        runtime = trt.Runtime(TRT_LOGGER) # serialized ICudEngine을 deserialized하기 위한 클래스 객체
+        trt.init_libnvinfer_plugins(None, "") # plugin 사용을 위함
         with open(self.model_path, 'rb') as f:
-            try:
-                engine = runtime.deserialize_cuda_engine(f.read())
-                self.model = engine
-            except:
-                sys.exit("Could not load model")
+            self.engine = runtime.deserialize_cuda_engine(f.read()) # trt 모델을 읽어 serialized ICudEngine을 deserialized함
+        
+        self.context = self.engine.create_execution_context() # ICudEngine을 이용해 inference를 실행하기 위한 context class생        assert self.engine 
+        assert self.context
         
         self.alloc_buf()
 
     def inference(self, input_image):
-        image = input_image.transpose(0, 3, 1, 2)
-        self.inputs[0].cpu = image.ravel()
-
-        with self.model.create_execution_context() as context:
-            [cuda.memcpy_htod_async(inp.gpu, inp.cpu, self.stream) for inp in self.inputs]
-            context.execute_async(self.batch, self.bindings, self.stream.handle, None)
-            [cuda.memcpy_dtoh_async(out.cpu, out.gpu, self.stream) for out in self.outputs]
-            self.stream.synchronize()
-
-        num_detections = self.outputs[0].cpu # detection된 object개수
-        nmsed_boxes = self.outputs[1].cpu # detection된 object coordinate
-        nmsed_scores = self.outputs[2].cpu # detection된 object confidence
-        nmsed_classes = self.outputs[3].cpu # detection된 object class number
+        image = input_image.transpose(0, 3, 1, 2) # NHWC to NWHC
+        image = np.ascontiguousarray(image) 
+        cuda.memcpy_htod(self.inputs[0]['allocation'], image) # input image array(host)를 GPU(device)로 보내주는 작업
+        self.context.execute_v2(self.allocations) #inference 실행!
+        for o in range(len(self.outputs)):
+            cuda.memcpy_dtoh(self.outputs[o]['host_allocation'], self.outputs[o]['allocation']) # GPU에서 작업한 값을 host로 보냄
+        
+        num_detections = self.outputs[0]['host_allocation'] # detection된 object개수
+        nmsed_boxes = self.outputs[1]['host_allocation'] # detection된 object coordinate
+        nmsed_scores = self.outputs[2]['host_allocation'] # detection된 object confidence
+        nmsed_classes = self.outputs[3]['host_allocation'] # detection된 object class number
         result = [num_detections, nmsed_boxes, nmsed_scores, nmsed_classes]
         return result
 
+
     def alloc_buf(self):
-        inputs = []
-        outputs = []
-        bindings = []
-        engine = self.model
-        input_size = engine.get_binding_shape(0)[2:4] if engine.get_binding_shape(0)[1]==3 else input_shape[1:3]
+        # Setup I/O bindings
+        self.inputs = []
+        self.outputs = []
+        self.allocations = []
 
-        class HostDeviceMem(object):
-            def __init__(self, cpu_mem, gpu_mem):
-                self.cpu = cpu_mem
-                self.gpu = gpu_mem
+        for i in range(self.engine.num_bindings):
+            is_input = False
+            if self.engine.binding_is_input(i): # i번째 binding이 input인지 확인
+                is_input = True 
+            name = self.engine.get_binding_name(i) # i번째 binding의 이름
+            dtype = np.dtype(trt.nptype(self.engine.get_binding_dtype(i))) # i번째 binding의 data type
+            shape = self.context.get_binding_shape(i) # i번째 binding의 shape
 
-        for binding in engine:
-            size = trt.volume(engine.get_binding_shape(binding))
-            dtype = trt.nptype(engine.get_binding_dtype(binding))
-            cpu_mem = cuda.pagelocked_empty(size, dtype)
-            gpu_mem = cuda.mem_alloc(cpu_mem.nbytes)
-            bindings.append(int(gpu_mem))
+            if is_input and shape[0] < 0:
+                assert self.engine.num_optimization_profiles > 0
+                profile_shape = self.engine.get_profile_shape(0, name)
+                assert len(profile_shape) == 3  # min,opt,max
+                # Set the *max* profile as binding shape
+                self.context.set_binding_shape(i, profile_shape[2])
+                shape = self.context.get_binding_shape(i)
+            if is_input:
+                self.batch_size = shape[0]
+            size = dtype.itemsize # data type의 bit수
+            for s in shape:
+                size *= s # data type * 각 shape(e.g input의 경우 [1,3,640,640]) element 을 곱하여 size에 할당
 
-            if engine.binding_is_input(binding):
-                inputs.append(HostDeviceMem(cpu_mem, gpu_mem))
-            else:
-                outputs.append(HostDeviceMem(cpu_mem, gpu_mem))
+            allocation = cuda.mem_alloc(size) # 해당 size만큼의 GPU memory allocation함
+            host_allocation = None if is_input else np.zeros(shape, dtype)
+            binding = {
+                "index": i,
+                "name": name,
+                "dtype": dtype,
+                "shape": list(shape),
+                "allocation": allocation,
+                "host_allocation": host_allocation,
+            }
+            self.allocations.append(allocation)
+            if self.engine.binding_is_input(i): # binding이 input이면
+                self.inputs.append(binding)
+            else: # 아니면 binding은 모두 output임
+                self.outputs.append(binding)
+            print("{} '{}' with shape {} and dtype {}".format(
+                "Input" if is_input else "Output",
+                binding['name'], binding['shape'], binding['dtype']))        
 
-        self.inputs = inputs
-        self.outputs = outputs
-        self.bindings = bindings
-        self.input_size = input_size
-        self.stream = cuda.Stream()
+        assert self.batch_size > 0
+        assert len(self.inputs) > 0
+        assert len(self.outputs) > 0
+        assert len(self.allocations) > 0
+
+    def input_spec(self):
+        return self.inputs[0]['shape'], self.inputs[0]['dtype']
+
+    def output_spec(self):
+        specs = []
+        for o in self.outputs:
+            specs.append((o['shape'], o['dtype']))
+        return specs
 
 
-def create_model_wrapper(extension: str, model_path: str, batch_size: int, device: str):
+def create_model_wrapper(model_path: str, batch_size: int, device: str):
     """Create model wrapper class."""
     assert trt and cuda, f"Loading TensorRT, Pycuda lib failed."
     model_wrapper = TRTWrapper(model_path, batch_size)
@@ -195,10 +162,8 @@ class InferenceRunner():
     """Inference Runner."""
     def __init__(
         self,
-        model_wrapper: ModelWrapper,
+        model_wrapper: TRTWrapper,
         img_folder: str,
-        conf_thres: float,
-        iou_thres: float,
         save_dir: str
     ):
         self.model = model_wrapper
@@ -220,7 +185,23 @@ class InferenceRunner():
             # inference
             inf_res = self.model.inference(preproc_image)
             self.print_result(preproc_image, inf_res, i, save_path)
+        
 
+        times = []
+        iterations = 200
+        for i in range(20):  # GPU warmup iterations
+            self.model.inference(preproc_image)
+        for i in range(iterations):
+            start = time.time()
+            self.model.inference(preproc_image)
+            times.append(time.time() - start)
+            print("Iteration {} / {}".format(i + 1, iterations), end="\r")
+        print("Benchmark results include time for H2D and D2H memory copies")
+        print("Average Latency: {:.3f} ms".format(
+            1000 * np.average(times)))
+        print("Average Throughput: {:.1f} ips".format(
+            1 / np.average(times)))
+            
     def preprocess_image(self, raw_bgr_image):
         """
         Description:
@@ -237,7 +218,7 @@ class InferenceRunner():
             origin_w: width of the origianl image
         """
 
-        input_size = self.model.input_size
+        input_size = self.model.input_spec()[0][-2:] # h,w = 640,640
         original_image = raw_bgr_image
         origin_h, origin_w, origin_c = original_image.shape
         image = cv2.cvtColor(original_image, cv2.COLOR_BGR2RGB)
@@ -281,14 +262,14 @@ class InferenceRunner():
         result_image = result_image.astype(np.uint8)
         print("--------------------------------------------------------------")
         for i in range(int(num_detections)):
-            detected = str(classes[int(nmsed_classes[i])]).replace('‘', '').replace('’', '')
-            confidence_str = str(nmsed_scores[i])
+            detected = str(classes[int(nmsed_classes[0][i])]).replace('‘', '').replace('’', '')
+            confidence_str = str(nmsed_scores[0][i])
             # unnormalize depending on the visualizing image size
-            x1 = int(nmsed_boxes[0+i*4])
-            y1 = int(nmsed_boxes[1+i*4])
-            x2 = int(nmsed_boxes[2+i*4])
-            y2 = int(nmsed_boxes[3+i*4])
-            color = colors(int(nmsed_classes[i]), True)
+            x1 = int(nmsed_boxes[0][i][0])
+            y1 = int(nmsed_boxes[0][i][1])
+            x2 = int(nmsed_boxes[0][i][2])
+            y2 = int(nmsed_boxes[0][i][3])
+            color = colors(int(nmsed_classes[0][i]), True)
             result_image = cv2.rectangle(result_image, (x1, y1), (x2, y2), color, 2)
             text_size, _ = cv2.getTextSize(str(detected), cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
             text_w, text_h = text_size
@@ -296,7 +277,7 @@ class InferenceRunner():
             result_image = cv2.putText(result_image, str(detected), (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
             print("Detect " + str(i+1) + "(" + str(detected) + ")")
             print("Coordinates : [{:d}, {:d}, {:d}, {:d}]".format(x1, y1, x2, y2))
-            print("Confidence : {:.7f}".format(nmsed_scores[i]))
+            print("Confidence : {:.7f}".format(nmsed_scores[0][i]))
             print("")
         print("--------------------------------------------------------------\n\n")
         cv2.imwrite(str(save_path), cv2.cvtColor(result_image, cv2.COLOR_BGR2RGB))
@@ -322,10 +303,7 @@ if __name__ == "__main__":
         classes = classes['names']
 
     # load model 
-    extension = os.path.splitext(args.model)[1]
-
     model_wrapper = create_model_wrapper(
-        extension=extension,
         model_path=args.model,
         batch_size=args.batch,
         device=args.device
@@ -333,7 +311,7 @@ if __name__ == "__main__":
     model_wrapper.load_model()
 
     # load image, inference, print result
-    inference_runner = InferenceRunner(model_wrapper, args.image_folder, args.conf_thres, args.iou_thres, args.save_dir)
+    inference_runner = InferenceRunner(model_wrapper, args.image_folder, args.save_dir)
     inference_runner.run()
 
 
