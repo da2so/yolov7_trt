@@ -1,7 +1,3 @@
-"""Runtime(TFLite, TensorRT) for NetsPresso model.
-- Author: Jimin Lee, Junghoon Kim
-- Contact: jimin.lee@nota.ai, junghoon.kim@nota.ai
-"""
 import cv2
 import numpy as np
 import time
